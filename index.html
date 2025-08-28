@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RAG→TTS Prompt Demo</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body { margin: 24px; background:#0b1020; color:#e8ecff; }
+    h1 { margin-top:0; font-size: 22px; }
+    .card { background:#111737; border:1px solid #2a3160; border-radius:16px; padding:16px; margin-bottom:16px; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .col { flex:1 1 260px; }
+    input[type="file"], input[type="text"], select, button, textarea, input[type="number"] { width:100%; padding:10px; border-radius:10px; border:1px solid #2a3160; background:#0f1430; color:#dbe0ff; }
+    button { cursor:pointer; border:1px solid #3f6df1; background:#2a46c0; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .log { white-space: pre-wrap; background:#0f1430; border-radius:10px; padding:10px; border:1px dashed #2a3160; max-height: 260px; overflow:auto; }
+    .pill { display:inline-block; padding:4px 10px; border-radius:999px; background:#16204a; border:1px solid #2a3160; margin-right:6px; font-size:12px; }
+    .hint { color:#9ab0ff; font-size: 13px; }
+    .ok { color:#6be29c }
+    .err { color:#ff8c8c }
+    label { display:block; margin-bottom:8px; }
+  </style>
+</head>
+<body>
+  <h1>📚 RAG → 🔊 TTS Prompt Demo</h1>
+
+  <div class="card">
+    <div class="pill">Step 1</div> <b>참고 자료 업로드 (인덱싱)</b>
+    <p class="hint">최소 <b>소설 TXT</b>만 업로드하면 됩니다. 캐릭터 카드/스타일 가이드/발음 사전은 선택.</p>
+    <div class="row">
+      <div class="col">
+        <label>소설 텍스트 (.txt)
+          <input id="f-novel" type="file" accept=".txt,.md,.markdown,.text" />
+        </label>
+      </div>
+      <div class="col">
+        <label>캐릭터 카드 (.txt / .md)
+          <input id="f-cc" type="file" accept=".txt,.md,.markdown" />
+        </label>
+      </div>
+      <div class="col">
+        <label>스타일 가이드 (.txt / .md)
+          <input id="f-style" type="file" accept=".txt,.md,.markdown" />
+        </label>
+      </div>
+      <div class="col">
+        <label>발음 사전 (.json)
+          <input id="f-lex" type="file" accept="application/json,.json" />
+        </label>
+      </div>
+    </div>
+    <div style="margin-top:12px; display:flex; gap:12px; align-items:center;">
+      <button id="btn-ingest">인덱싱 실행</button>
+      <span id="ingest-status" class="hint"></span>
+    </div>
+    <div id="ingest-log" class="log" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="card">
+    <div class="pill">Step 2 (단일 대사)</div> <b>TTS 프롬프트 생성</b>
+    <div class="row">
+      <div class="col">
+        <label>Speaker ID
+          <input id="speaker" type="text" value="S1" />
+        </label>
+      </div>
+      <div class="col">
+        <label>Scene Tag
+          <input id="scene" type="text" value="default" />
+        </label>
+      </div>
+    </div>
+    <div style="margin-top:8px">
+      <label>Utterance
+        <textarea id="utterance" rows="3" placeholder="여기에 대사를 입력하세요"></textarea>
+      </label>
+    </div>
+    <div style="margin-top:12px; display:flex; gap:12px; align-items:center;">
+      <button id="btn-tts">TTS JSON 생성</button>
+      <span id="tts-status" class="hint"></span>
+    </div>
+    <div id="tts-out" class="log" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="card">
+    <div class="pill">Step 3 (배치)</div> <b>원문 TXT 전체 → TTS JSON 묶음</b>
+    <p class="hint">원문 TXT를 그대로 올리면, 자동으로 <b>토큰 제한을 넘지 않도록 분할</b>하여 각 발화별 TTS 프롬프트를 생성하고, 하나의 JSON으로 합쳐서 돌려줍니다.</p>
+    <div class="row">
+      <div class="col">
+        <label>원문 TXT 업로드
+          <input id="f-tts-full" type="file" accept=".txt,.md,.markdown,.text" />
+        </label>
+      </div>
+      <div class="col">
+        <label>인덱싱도 함께 수행 (권장)
+          <select id="also-ingest">
+            <option value="true" selected>true</option>
+            <option value="false">false</option>
+          </select>
+        </label>
+      </div>
+      <div class="col">
+        <label>최대 처리 발화 수 (테스트용)
+          <input id="max-items" type="number" placeholder="예: 50 (비우면 전체)" />
+        </label>
+      </div>
+    </div>
+    <div style="margin-top:12px; display:flex; gap:12px; align-items:center;">
+      <button id="btn-tts-batch">전체 TTS JSON 생성</button>
+      <button id="btn-download" disabled>JSON 다운로드</button>
+      <span id="tts-batch-status" class="hint"></span>
+    </div>
+    <div id="tts-batch-out" class="log" style="margin-top:12px;"></div>
+  </div>
+
+  <script>
+    const $ = (sel) => document.querySelector(sel);
+    const log = (el, msg, cls="") => {
+      el.textContent = msg;
+      if (cls) el.className = "log " + cls; else el.className = "log";
+    };
+
+    async function ingest() {
+      const novel = $('#f-novel').files[0];
+      if (!novel) { alert('소설 텍스트 파일은 필수입니다.'); return; }
+      const fd = new FormData();
+      fd.append('novel', novel);
+      if ($('#f-cc').files[0]) fd.append('character_cards', $('#f-cc').files[0]);
+      if ($('#f-style').files[0]) fd.append('style_guide', $('#f-style').files[0]);
+      if ($('#f-lex').files[0]) fd.append('lexicon', $('#f-lex').files[0]);
+
+      $('#btn-ingest').disabled = true; $('#ingest-status').textContent = '업로드/인덱싱 중…';
+      log($('#ingest-log'), '');
+      try {
+        const res = await fetch('/ingest_upload', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'ingest 실패');
+        $('#ingest-status').textContent = '완료 ✅';
+        log($('#ingest-log'), JSON.stringify(data, null, 2), 'ok');
+      } catch (e) {
+        $('#ingest-status').textContent = '실패 ❌';
+        log($('#ingest-log'), String(e), 'err');
+      } finally {
+        $('#btn-ingest').disabled = false;
+      }
+    }
+
+    async function genTTS() {
+      const utterance = $('#utterance').value.trim();
+      if (!utterance) { alert('Utterance를 입력하세요'); return; }
+      const payload = {
+        utterance,
+        speaker_id: $('#speaker').value.trim() || 'S1',
+        scene: $('#scene').value.trim() || 'default',
+      };
+      $('#btn-tts').disabled = true; $('#tts-status').textContent = '생성 중…';
+      log($('#tts-out'), '');
+      try {
+        const res = await fetch('/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '생성 실패');
+        $('#tts-status').textContent = '완료 ✅';
+        log($('#tts-out'), JSON.stringify(data, null, 2), 'ok');
+      } catch (e) {
+        $('#tts-status').textContent = '실패 ❌';
+        log($('#tts-out'), String(e), 'err');
+      } finally {
+        $('#btn-tts').disabled = false;
+      }
+    }
+
+    async function genBatchTTS() {
+      const novel = $('#f-tts-full').files[0];
+      if (!novel) { alert('원문 TXT를 선택하세요'); return; }
+      const fd = new FormData();
+      fd.append('novel', novel);
+      const also = $('#also-ingest').value === 'true';
+      fd.append('also_ingest', also ? 'true' : 'false');
+      const maxItemsVal = $('#max-items').value.trim();
+      if (maxItemsVal) fd.append('max_items', maxItemsVal);
+
+      $('#btn-tts-batch').disabled = true; $('#tts-batch-status').textContent = '생성 중…';
+      $('#btn-download').disabled = true;
+      log($('#tts-batch-out'), '');
+      try {
+        const res = await fetch('/tts_from_txt_upload', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '배치 생성 실패');
+        $('#tts-batch-status').textContent = `완료 ✅ 총 ${data.count} 항목`;
+        log($('#tts-batch-out'), JSON.stringify(data, null, 2), 'ok');
+
+        if (data.download_url) {
+          const btn = $('#btn-download');
+          btn.disabled = false;
+          btn.onclick = async () => {
+            const r = await fetch(data.download_url);
+            const blob = await r.blob();
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'tts_prompts.json';
+            a.click();
+            URL.revokeObjectURL(a.href);
+          };
+        }
+      } catch (e) {
+        $('#tts-batch-status').textContent = '실패 ❌';
+        log($('#tts-batch-out'), String(e), 'err');
+      } finally {
+        $('#btn-tts-batch').disabled = false;
+      }
+    }
+
+    $('#btn-ingest').addEventListener('click', ingest);
+    $('#btn-tts').addEventListener('click', genTTS);
+    $('#btn-tts-batch').addEventListener('click', genBatchTTS);
+  </script>
+</body>
+</html>
