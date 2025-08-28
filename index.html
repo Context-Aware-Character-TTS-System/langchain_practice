@@ -58,6 +58,45 @@
   </div>
 
   <div class="card">
+    <div class="pill">Step 1½</div> <b>TXT만으로 카드/가이드/발음 사전 자동 생성 (A)</b>
+    <p class="hint">소설 TXT만 올려도 캐릭터 카드/스타일 가이드/발음 사전을 LLM으로 자동 생성합니다. 필요 시 즉시 인덱싱까지.</p>
+    <div class="row">
+      <div class="col">
+        <label>원문 TXT 업로드
+          <input id="f-bootstrap" type="file" accept=".txt,.md,.markdown,.text" />
+        </label>
+      </div>
+      <div class="col">
+        <label>인덱싱도 함께 수행
+          <select id="bs-ingest">
+            <option value="true" selected>true</option>
+            <option value="false">false</option>
+          </select>
+        </label>
+      </div>
+      <div class="col">
+        <label>상위 화자 수
+          <input id="bs-top" type="number" value="8" />
+        </label>
+      </div>
+      <div class="col">
+        <label>화자당 샘플 줄수
+          <input id="bs-lines" type="number" value="40" />
+        </label>
+      </div>
+    </div>
+    <div style="margin-top:12px; display:flex; gap:12px; align-items:center;">
+      <button id="btn-bootstrap">자동 생성</button>
+      <button id="btn-bs-ingest-now" disabled>지금 인덱싱</button>
+      <a id="dl-cc" class="pill" href="#" style="display:none" download="character_cards.txt">카드 다운로드</a>
+      <a id="dl-sg" class="pill" href="#" style="display:none" download="style_guide.md">가이드 다운로드</a>
+      <a id="dl-lx" class="pill" href="#" style="display:none" download="lexicon.json">사전 다운로드</a>
+      <span id="bs-status" class="hint"></span>
+    </div>
+    <div id="bs-log" class="log" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="card">
     <div class="pill">Step 2 (단일 대사)</div> <b>TTS 프롬프트 생성</b>
     <div class="row">
       <div class="col">
@@ -146,6 +185,78 @@
       }
     }
 
+    async function bootstrapA() {
+      const novel = $('#f-bootstrap').files[0];
+      if (!novel) { alert('원문 TXT를 선택하세요'); return; }
+      const fd = new FormData();
+      fd.append('novel', novel);
+      fd.append('also_ingest', $('#bs-ingest').value === 'true' ? 'true' : 'false');
+      const top = ($('#bs-top').value || '8');
+      const lines = ($('#bs-lines').value || '40');
+      fd.append('top_speakers', top);
+      fd.append('max_lines_per_speaker', lines);
+
+      $('#btn-bootstrap').disabled = true; $('#bs-status').textContent = '생성 중… (LLM 호출)';
+      log($('#bs-log'), '');
+      try {
+        const res = await fetch('/bootstrap_from_txt_upload', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '자동 생성 실패');
+        $('#bs-status').textContent = '완료 ✅';
+        log($('#bs-log'), JSON.stringify(data, null, 2), 'ok');
+
+        // 세션 기억 + Step1 반영 or 인덱싱 버튼 활성화
+        if (data.session) {
+          const btnNow = $('#btn-bs-ingest-now');
+          btnNow.dataset.session = data.session;
+          if ($('#bs-ingest').value === 'true' && data.added) {
+            $('#ingest-status').textContent = '완료 ✅ (부트스트랩 자동 인덱싱)';
+            log($('#ingest-log'), JSON.stringify({status:'ok', added: data.added}, null, 2), 'ok');
+          } else {
+            btnNow.disabled = false; // 사용자 요청 시 바로 인덱싱 가능
+          }
+        }
+
+        // 다운로드 링크 노출
+        if (data.downloads) {
+          const cc = $('#dl-cc'); const sg = $('#dl-sg'); const lx = $('#dl-lx');
+          cc.href = data.downloads.character_cards; cc.style.display = 'inline-block';
+          sg.href = data.downloads.style_guide;     sg.style.display = 'inline-block';
+          lx.href = data.downloads.lexicon;        lx.style.display = 'inline-block';
+        }
+      } catch (e) {
+        $('#bs-status').textContent = '실패 ❌';
+        log($('#bs-log'), String(e), 'err');
+      } finally {
+        $('#btn-bootstrap').disabled = false;
+      }
+    }
+
+    async function ingestBootstrapSession() {
+      const sess = $('#btn-bs-ingest-now').dataset.session;
+      if (!sess) { alert('세션 정보가 없습니다. 먼저 자동 생성(A)을 실행하세요.'); return; }
+      const payload = { session: sess };
+      $('#btn-bs-ingest-now').disabled = true; $('#bs-status').textContent = '인덱싱 중…';
+      try {
+        const res = await fetch('/ingest_session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '인덱싱 실패');
+        $('#bs-status').textContent = '인덱싱 완료 ✅';
+        // Step 1 패널에도 반영
+        $('#ingest-status').textContent = '완료 ✅ (부트스트랩 경유)';
+        log($('#ingest-log'), JSON.stringify(data, null, 2), 'ok');
+      } catch (e) {
+        $('#bs-status').textContent = '실패 ❌';
+        log($('#bs-log'), String(e), 'err');
+      } finally {
+        $('#btn-bs-ingest-now').disabled = false;
+      }
+    }
+
     async function genTTS() {
       const utterance = $('#utterance').value.trim();
       if (!utterance) { alert('Utterance를 입력하세요'); return; }
@@ -216,6 +327,8 @@
     }
 
     $('#btn-ingest').addEventListener('click', ingest);
+    $('#btn-bootstrap').addEventListener('click', bootstrapA);
+    $('#btn-bs-ingest-now').addEventListener('click', ingestBootstrapSession);
     $('#btn-tts').addEventListener('click', genTTS);
     $('#btn-tts-batch').addEventListener('click', genBatchTTS);
   </script>
