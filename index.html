@@ -26,6 +26,18 @@
   <h1>📚 RAG → 🔊 TTS Prompt Demo</h1>
 
   <div class="card">
+    <div class="pill">공통</div> <b>작품 ID 설정</b>
+    <p class="hint">작품별로 ID를 지정하면, 같은 DB에서도 검색이 섞이지 않습니다. 비워두면 파일명 기반으로 자동 지정됩니다.</p>
+    <div class="row">
+      <div class="col">
+        <label>작품 ID (corpus_id)
+          <input id="corpus-id" type="text" placeholder="예: novel_alpha" />
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="pill">Step 1</div> <b>참고 자료 업로드 (인덱싱)</b>
     <p class="hint">최소 <b>소설 TXT</b>만 업로드하면 됩니다. 캐릭터 카드/스타일 가이드/발음 사전은 선택.</p>
     <div class="row">
@@ -155,10 +167,8 @@
 
   <script>
     const $ = (sel) => document.querySelector(sel);
-    const log = (el, msg, cls="") => {
-      el.textContent = msg;
-      if (cls) el.className = "log " + cls; else el.className = "log";
-    };
+    const log = (el, msg, cls="") => { el.textContent = msg; el.className = cls? "log "+cls : "log"; };
+    const getCorpus = () => ($('#corpus-id').value || '').trim();
 
     async function ingest() {
       const novel = $('#f-novel').files[0];
@@ -168,6 +178,8 @@
       if ($('#f-cc').files[0]) fd.append('character_cards', $('#f-cc').files[0]);
       if ($('#f-style').files[0]) fd.append('style_guide', $('#f-style').files[0]);
       if ($('#f-lex').files[0]) fd.append('lexicon', $('#f-lex').files[0]);
+      const corpus = getCorpus();
+      if (corpus) fd.append('corpus_id', corpus);
 
       $('#btn-ingest').disabled = true; $('#ingest-status').textContent = '업로드/인덱싱 중…';
       log($('#ingest-log'), '');
@@ -175,7 +187,7 @@
         const res = await fetch('/ingest_upload', { method: 'POST', body: fd });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || 'ingest 실패');
-        $('#ingest-status').textContent = '완료 ✅';
+        $('#ingest-status').textContent = `완료 ✅ (corpus=${data.corpus_id || corpus || 'auto'})`;
         log($('#ingest-log'), JSON.stringify(data, null, 2), 'ok');
       } catch (e) {
         $('#ingest-status').textContent = '실패 ❌';
@@ -195,6 +207,8 @@
       const lines = ($('#bs-lines').value || '40');
       fd.append('top_speakers', top);
       fd.append('max_lines_per_speaker', lines);
+      const corpus = getCorpus();
+      if (corpus) fd.append('corpus_id', corpus);
 
       $('#btn-bootstrap').disabled = true; $('#bs-status').textContent = '생성 중… (LLM 호출)';
       log($('#bs-log'), '');
@@ -205,19 +219,18 @@
         $('#bs-status').textContent = '완료 ✅';
         log($('#bs-log'), JSON.stringify(data, null, 2), 'ok');
 
-        // 세션 기억 + Step1 반영 or 인덱싱 버튼 활성화
         if (data.session) {
           const btnNow = $('#btn-bs-ingest-now');
           btnNow.dataset.session = data.session;
+          btnNow.dataset.corpusId = data.corpus_id || corpus || '';
           if ($('#bs-ingest').value === 'true' && data.added) {
-            $('#ingest-status').textContent = '완료 ✅ (부트스트랩 자동 인덱싱)';
-            log($('#ingest-log'), JSON.stringify({status:'ok', added: data.added}, null, 2), 'ok');
+            $('#ingest-status').textContent = `완료 ✅ (부트스트랩 자동 인덱싱, corpus=${data.corpus_id})`;
+            log($('#ingest-log'), JSON.stringify({status:'ok', added: data.added, corpus_id: data.corpus_id}, null, 2), 'ok');
           } else {
-            btnNow.disabled = false; // 사용자 요청 시 바로 인덱싱 가능
+            btnNow.disabled = false;
           }
         }
 
-        // 다운로드 링크 노출
         if (data.downloads) {
           const cc = $('#dl-cc'); const sg = $('#dl-sg'); const lx = $('#dl-lx');
           cc.href = data.downloads.character_cards; cc.style.display = 'inline-block';
@@ -234,8 +247,9 @@
 
     async function ingestBootstrapSession() {
       const sess = $('#btn-bs-ingest-now').dataset.session;
+      const corpusId = $('#btn-bs-ingest-now').dataset.corpusId || getCorpus();
       if (!sess) { alert('세션 정보가 없습니다. 먼저 자동 생성(A)을 실행하세요.'); return; }
-      const payload = { session: sess };
+      const payload = corpusId ? { session: sess, corpus_id: corpusId } : { session: sess };
       $('#btn-bs-ingest-now').disabled = true; $('#bs-status').textContent = '인덱싱 중…';
       try {
         const res = await fetch('/ingest_session', {
@@ -245,8 +259,7 @@
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || '인덱싱 실패');
-        $('#bs-status').textContent = '인덱싱 완료 ✅';
-        // Step 1 패널에도 반영
+        $('#bs-status').textContent = `인덱싱 완료 ✅ (corpus=${data.corpus_id || corpusId || 'auto'})`;
         $('#ingest-status').textContent = '완료 ✅ (부트스트랩 경유)';
         log($('#ingest-log'), JSON.stringify(data, null, 2), 'ok');
       } catch (e) {
@@ -265,12 +278,14 @@
         speaker_id: $('#speaker').value.trim() || 'S1',
         scene: $('#scene').value.trim() || 'default',
       };
+      const corpus = getCorpus();
+      if (corpus) payload.corpus_id = corpus;
+
       $('#btn-tts').disabled = true; $('#tts-status').textContent = '생성 중…';
       log($('#tts-out'), '');
       try {
         const res = await fetch('/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
         const data = await res.json();
@@ -294,6 +309,8 @@
       fd.append('also_ingest', also ? 'true' : 'false');
       const maxItemsVal = $('#max-items').value.trim();
       if (maxItemsVal) fd.append('max_items', maxItemsVal);
+      const corpus = getCorpus();
+      if (corpus) fd.append('corpus_id', corpus);
 
       $('#btn-tts-batch').disabled = true; $('#tts-batch-status').textContent = '생성 중…';
       $('#btn-download').disabled = true;
@@ -302,7 +319,7 @@
         const res = await fetch('/tts_from_txt_upload', { method: 'POST', body: fd });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || '배치 생성 실패');
-        $('#tts-batch-status').textContent = `완료 ✅ 총 ${data.count} 항목`;
+        $('#tts-batch-status').textContent = `완료 ✅ 총 ${data.count} 항목 (corpus=${data.corpus_id})`;
         log($('#tts-batch-out'), JSON.stringify(data, null, 2), 'ok');
 
         if (data.download_url) {
