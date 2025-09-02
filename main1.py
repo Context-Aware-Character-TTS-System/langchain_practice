@@ -2,12 +2,14 @@ import os
 import json
 import uuid
 import re
+import asyncio
+import difflib
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from dataclasses import dataclass
 from collections import Counter, defaultdict
 
-from fastapi import FastAPI, Body, UploadFile, File, HTTPException
+from fastapi import FastAPI, Body, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from dotenv import load_dotenv
@@ -46,14 +48,17 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 USE_OPENAI_EMB = os.getenv("USE_OPENAI_EMBEDDINGS", "false").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_CORPUS = os.getenv("DEFAULT_CORPUS_ID", "default")
+BATCH_CONCURRENCY = int(os.getenv("BATCH_CONCURRENCY", "6"))
 
-app = FastAPI(title="RAG→TTS Prompt Service", version="0.5.0")
+app = FastAPI(title="RAG→TTS Prompt Service", version="0.6.0")
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # -------------------------------------------------
@@ -62,9 +67,11 @@ app.add_middleware(
 def get_embedding():
     if USE_OPENAI_EMB:
         return OpenAIEmbeddings(model="text-embedding-3-large")
+    # 로컬 임베딩(토큰 비용 0원)
     return HuggingFaceEmbeddings(model_name="intfloat/e5-small-v2")
 
 def get_llm():
+    # OpenAI LLM만 예시 (키는 .env에)
     return ChatOpenAI(model=OPENAI_MODEL, temperature=0)
 
 EMB = get_embedding()
@@ -87,9 +94,12 @@ def get_vs() -> Chroma:
     )
 
 # -------------------------------------------------
-# Lexicon (작품별)
+# In-memory corpus data
 # -------------------------------------------------
-LEXICONS: Dict[str, Dict[str, str]] = defaultdict(dict)  # corpus_id -> {term: pron}
+# 작품별 발음 사전, 캐릭터 이름 목록
+LEXICONS: Dict[str, Dict[str, str]] = defaultdict(dict)      # corpus_id -> {term: pron}
+CHAR_NAMES: Dict[str, Set[str]] = defaultdict(set)            # corpus_id -> { "개구리 왕자", ... }
+CASTS: Dict[str, Dict[str, str]] = defaultdict(dict)  # corpus_id -> { character_name: voice_actor }
 
 # -------------------------------------------------
 # Helpers
@@ -99,33 +109,62 @@ def load_text_file(path: Path) -> str:
         return f.read()
 
 def _make_splitter():
+    # token 기반 → 없으면 char 기반
     try:
         splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-            encoding_name="cl100k_base", chunk_size=400, chunk_overlap=80
+            encoding_name="cl100k_base",
+            chunk_size=900,        # ⬅ ingest 속도↑ (청크 수↓)
+            chunk_overlap=120,
         )
         return splitter
     except Exception:
         return RecursiveCharacterTextSplitter(
-            chunk_size=900, chunk_overlap=150, separators=["\n\n", "\n", " "]
+            chunk_size=1200, chunk_overlap=150, separators=["\n\n", "\n", " "]
         )
 
+def _sanitize_corpus_id(raw: Optional[str]) -> str:
+    if not raw:
+        return DEFAULT_CORPUS
+    s = re.sub(r"[^\w\-]+", "_", raw.strip())
+    return s or DEFAULT_CORPUS
+
 def _meta(kind: str, corpus_id: Optional[str], extra: Optional[Dict] = None):
-    m = {"kind": kind, "corpus_id": corpus_id or DEFAULT_CORPUS}
+    m = {"kind": kind, "corpus_id": _sanitize_corpus_id(corpus_id)}
     if extra:
         m.update(extra)
     return m
 
-def _sanitize_corpus_id(raw: str) -> str:
-    # 파일명/입력에서 안전한 corpus id 생성
-    s = re.sub(r"[^\w\-]+", "_", raw.strip())
-    return s or DEFAULT_CORPUS
+def _eq(field: str, value: str) -> Dict:
+    # Chroma 최신 where 문법 호환 ($and + $eq)
+    return {field: {"$eq": value}}
 
-def _resolve_corpus_id(novel_path: Optional[Path], provided: Optional[str]) -> str:
-    if provided:
-        return _sanitize_corpus_id(provided)
-    if novel_path:
-        return _sanitize_corpus_id(novel_path.stem)
-    return DEFAULT_CORPUS
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", "", s or "").lower()
+
+def _best_match(name: str, corpus_id: str) -> str:
+    """화자 이름을 카드의 정식 이름으로 정규화."""
+    if not name or name in ("Narrator", "Unknown"):
+        return name or "Unknown"
+    names = list(CHAR_NAMES.get(corpus_id, set()))
+    if not names:
+        return name
+
+    n = _norm(name)
+    # 완전/포함 일치 우선
+    for cand in names:
+        cn = _norm(cand)
+        if cn == n or cn in n or n in cn:
+            return cand
+
+    # 유사도 매칭(완화)
+    best, score = None, 0.0
+    for cand in names:
+        s = difflib.SequenceMatcher(None, n, _norm(cand)).ratio()
+        if s > score:
+            best, score = cand, s
+    if score >= 0.6:   # 0.72 → 0.6으로 완화(고전 텍스트 단축형 커버)
+        return best
+    return name
 
 # -------------------------------------------------
 # Doc builders
@@ -134,31 +173,62 @@ def to_docs_from_text(text: str, kind: str, corpus_id: Optional[str], extra_meta
     splitter = _make_splitter()
     chunks = splitter.split_text(text)
     docs = [
-        Document(
-            page_content=c, 
-            metadata=_meta(kind, corpus_id, extra=extra_meta)
-        )
+        Document(page_content=c, metadata=_meta(kind, corpus_id, extra_meta))
         for c in chunks if c.strip()
     ]
     return docs
 
 def to_docs_character_cards(raw: str, corpus_id: Optional[str]) -> List[Document]:
-    docs = []
+    """
+    카드 포맷 예시:
+      홍길동(성우=김OO): 정의감 강함, 존댓말 / 격정적일 땐 속도↑
+      홍판서: 위압적, 낮고 느림
+      길동|성우=박OO: 청년, 공손체
+    """
+    cid = _sanitize_corpus_id(corpus_id)
+    docs: List[Document] = []
     for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+        s = line.strip()
+        if not s or s.startswith("#"):
             continue
-        if ":" in line:
-            name, desc = line.split(":", 1)
-            docs.append(
-                Document(
-                    page_content=desc.strip(),
-                    metadata=_meta("character_card", corpus_id, {"character": name.strip()}),
-                )
+
+        # name_part : desc 로 분리
+        if ":" not in s:
+            continue
+        name_part, desc = s.split(":", 1)
+        name_part = name_part.strip()
+        desc = desc.strip()
+        if not name_part:
+            continue
+
+        # 성우=... 추출 (괄호/파이프 모두 지원)
+        va = None
+        m = re.search(r"성우\s*=\s*([^)|\s]+)", name_part)
+        if m:
+            va = m.group(1).strip()
+
+        # 이름 정제(괄호/파이프 뒤 내용 제거)
+        name = re.sub(r"\(.*?\)", "", name_part)
+        name = re.sub(r"\|.*$", "", name).strip()
+        if not name:
+            continue
+
+        CHAR_NAMES[cid].add(name)
+        if va:
+            CASTS[cid][name] = va
+
+        docs.append(
+            Document(
+                page_content=desc or name,
+                metadata=_meta("character_card", cid, {"character": name, "voice_actor": va} if va else {"character": name}),
             )
-    # 전체 카드 텍스트도 의미검색용으로 1건 추가
-    docs.append(Document(page_content=raw, metadata=_meta("character_card", corpus_id)))
+        )
+
+    # 전체 텍스트도 하나 보관(검색)
+    if raw.strip():
+        docs.append(Document(page_content=raw, metadata=_meta("character_card", cid)))
     return docs
+
 
 def to_docs_style_guides(raw: str, corpus_id: Optional[str]) -> List[Document]:
     return [Document(page_content=raw, metadata=_meta("style_guide", corpus_id))]
@@ -173,7 +243,7 @@ def ingest_corpus_from_paths(
     lexicon_path: Optional[Path] = None,
     corpus_id: Optional[str] = None,
 ):
-    corpus_id = _resolve_corpus_id(novel_path, corpus_id)
+    corpus_id = _sanitize_corpus_id(corpus_id or novel_path.stem)
     vs = get_vs()
 
     # Novel
@@ -216,6 +286,7 @@ def ingest_corpus_from_paths(
             "character_cards": len(cc_docs),
             "style_guides": len(sg_docs),
             "lexicon_terms": len(LEXICONS[corpus_id]),
+            "characters": sorted(list(CHAR_NAMES.get(corpus_id, set()))),
         },
     }
 
@@ -223,11 +294,11 @@ def ingest_corpus_from_paths(
 # Retrieval & generation
 # -------------------------------------------------
 def retrieve_context(utterance: str, speaker_id: str, scene: str, corpus_id: str,
-                     k_novel=2, k_card=2, k_style=1) -> str:
+                     k_novel=1, k_card=1, k_style=1) -> str:
     vs = get_vs()
-    filt_novel = {"kind": "novel_chunk",   "corpus_id": corpus_id}
-    filt_card  = {"kind": "character_card","corpus_id": corpus_id}
-    filt_style = {"kind": "style_guide",   "corpus_id": corpus_id}
+    filt_novel = {"$and": [_eq("kind", "novel_chunk"),   _eq("corpus_id", corpus_id)]}
+    filt_card  = {"$and": [_eq("kind", "character_card"), _eq("corpus_id", corpus_id)]}
+    filt_style = {"$and": [_eq("kind", "style_guide"),   _eq("corpus_id", corpus_id)]}
 
     ret_novel = vs.as_retriever(search_kwargs={"k": k_novel, "filter": filt_novel})
     ret_card  = vs.as_retriever(search_kwargs={"k": k_card,  "filter": filt_card})
@@ -263,7 +334,16 @@ PROMPT = ChatPromptTemplate.from_messages([
     ),
 ])
 
-def generate_tts_prompt(utterance: str, speaker_id: str, scene: str, corpus_id: str) -> Dict:
+def _postprocess_speaker_id(raw_json: Dict, inferred: str, corpus_id: str) -> Dict:
+    fixed = _best_match(inferred, corpus_id)
+    raw_json["speaker_id"] = fixed
+    # 캐스팅 정보 동봉(있으면)
+    va = CASTS.get(corpus_id, {}).get(fixed)
+    if va:
+        raw_json["voice_actor"] = va
+    return raw_json
+
+def generate_tts_prompt_sync(utterance: str, speaker_id: str, scene: str, corpus_id: str) -> Dict:
     context = retrieve_context(utterance, speaker_id, scene, corpus_id=corpus_id)
     overrides = subset_lexicon(utterance, corpus_id=corpus_id)
 
@@ -279,9 +359,9 @@ def generate_tts_prompt(utterance: str, speaker_id: str, scene: str, corpus_id: 
     ).content
 
     try:
-        return json.loads(result)
+        data = json.loads(result)
     except json.JSONDecodeError:
-        return {
+        data = {
             "speaker_id": speaker_id,
             "voice_hint": {"gender": "unknown", "age": "unknown"},
             "style": {"mood": "neutral", "formality": "기본", "energy": "medium"},
@@ -290,171 +370,173 @@ def generate_tts_prompt(utterance: str, speaker_id: str, scene: str, corpus_id: 
             "text": utterance,
             "_raw": result,
         }
+    return _postprocess_speaker_id(data, speaker_id, corpus_id)
+
+async def generate_tts_prompt_async(utterance: str, speaker_id: str, scene: str, corpus_id: str) -> Dict:
+    # 동시성용(속도↑)
+    context = retrieve_context(utterance, speaker_id, scene, corpus_id=corpus_id)
+    overrides = subset_lexicon(utterance, corpus_id=corpus_id)
+    res = await (PROMPT | LLM).ainvoke({
+        "context": context,
+        "lexicon": json.dumps(overrides, ensure_ascii=False),
+        "speaker_id": speaker_id,
+        "scene": scene,
+        "utterance": utterance,
+    })
+    try:
+        data = json.loads(res.content)
+    except Exception:
+        data = {
+            "speaker_id": speaker_id,
+            "voice_hint": {"gender": "unknown", "age": "unknown"},
+            "style": {"mood": "neutral", "formality": "기본", "energy": "medium"},
+            "tts_params": {"rate": 1.0, "pitch": 0, "volume": 0},
+            "pronunciation_overrides": overrides,
+            "text": utterance,
+            "_raw": res.content,
+        }
+    return _postprocess_speaker_id(data, speaker_id, corpus_id)
 
 # -------------------------------------------------
-# Utterance parsing
+# Advanced utterance parser: split quotes vs narration, infer speaker
 # -------------------------------------------------
-# 원래 파서
-# def parse_utterances_from_text(text: str):
-#     lines = text.splitlines()
-#     current_scene = "default"
-#     items = []
-#     for raw in lines:
-#         line = raw.strip()
-#         if not line:
-#             continue
-#         if re.match(r'^(#+)\s+(.+)', line):
-#             current_scene = re.sub(r'^(#+)\s+', '', line);  continue
-#         if re.match(r'^(\d+\s*장\.?|CHAPTER\s+\d+)', line, flags=re.I):
-#             current_scene = line;  continue
-#         m = re.match(r'^(S[\w\d]+)\s*:\s*(.+)$', line)
-#         if m:
-#             speaker = m.group(1);  utt = m.group(2).strip()
-#             if utt:
-#                 items.append({"speaker_id": speaker, "scene": current_scene, "utterance": utt})
-#             continue
-#         items.append({"speaker_id": "Narrator", "scene": current_scene, "utterance": line})
-#     return items
-# 수정 후 파서
-# --- Advanced utterance parser: split quotes vs narration, infer speaker from reporting clause ---
+# 따옴표 쌍 정의
+_QUOTE_PAIRS = {
+    "“": "”", '"': '"', "‘": "’", "'": "'", "「": "」", "『": "』",
+}
 
-# 따옴표 패턴들(순서 유지: 먼저 매칭되는 걸 사용)
-_QUOTE_REGEXES = [
-    re.compile(r'“([^”]+)”'),
-    re.compile(r'"([^"]+)"'),
-    re.compile(r'『([^』]+)』'),
-    re.compile(r'「([^」]+)」'),
-    re.compile(r'‘([^’]+)’'),
-    re.compile(r"'([^']+)'"),
-]
-
-# 보고(말하다) 동사(어간/활용 일부 포함)
-_SAID_VERB = r'(?:말했|말하|중얼|외쳤|물었|대답했|속삭였|소리쳤|되물었|덧붙였|응수했|부르|불렀|말한다|말하다)'
-
-# 화자 후보를 추정(따옴표 앞/뒤 컨텍스트)
-def _detect_speaker_name(_pre: str, _post: str) -> Optional[str]:
-    pre = _pre[-40:] if _pre else ""
-    post = _post[:40] if _post else ""
-
-    # "…"(라고) <이름>(가/이/는/은) <말했…>
-    m = re.search(
-        rf'(?:라고|라며|하며|하고)?\s*([가-힣A-Za-z0-9 ]{{1,20}}?)(?:가|이|는|은)\s*{_SAID_VERB}',
-        post
-    )
+def _detect_speaker_name(pre_ctx: str, post_ctx: str) -> Optional[str]:
+    _SAID_VERB = r'(?:말했|말하|중얼|외쳤|물었|아뢰었|아뢰였|대답했|속삭였|소리쳤|되물었|덧붙였|응수했|부르|불렀)'
+    # "…"(라고) <이름> (가|이|는|은) <말했…>
+    m = re.search(rf'(?:라고|라며|하며|하고)?\s*([가-힣A-Za-z0-9 ]{{1,20}}?)(?:가|이|는|은)\s*{_SAID_VERB}', post_ctx)
     if m:
-        name = m.group(1).strip()
-        if name not in {"그", "그녀", "누군가", "사람", "아이"}:
-            return name
-
-    # <이름>(가/이/는/은) <말했…> "…"
-    m = re.search(
-        rf'([가-힣A-Za-z0-9 ]{{1,20}}?)(?:가|이|는|은)\s*{_SAID_VERB}\s*(?:며|라고)?\s*$',
-        pre
-    )
+        cand = m.group(1).strip()
+        if cand not in {"그", "그녀", "누군가", "사람", "아이"}:
+            return cand
+    # <이름> (가|이|는|은) <말했…> "…"
+    m = re.search(rf'([가-힣A-Za-z0-9 ]{{1,20}}?)(?:가|이|는|은)\s*{_SAID_VERB}\s*(?:며|라고)?\s*$', pre_ctx)
     if m:
-        name = m.group(1).strip()
-        if name not in {"그", "그녀", "누군가", "사람", "아이"}:
-            return name
+        cand = m.group(1).strip()
+        if cand not in {"그", "그녀", "누군가", "사람", "아이"}:
+            return cand
+    return None
 
-    return None  # 못 찾으면 None
+def _merge_adjacent(items: List[Dict]) -> List[Dict]:
+    """연속된 나레이션은 붙여서 덩어리 줄이기."""
+    out: List[Dict] = []
+    for it in items:
+        if out and it["speaker_id"] == "Narrator" and out[-1]["speaker_id"] == "Narrator" and it["scene"] == out[-1]["scene"]:
+            out[-1]["utterance"] += (" " if out[-1]["utterance"] and not out[-1]["utterance"].endswith("\n") else "") + it["utterance"]
+        else:
+            out.append(it)
+    return out
 
-# 한 줄에서 따옴표 기준으로 [나레이션] — [대사] — [나레이션] … 분리
-def _split_line_by_quotes(line: str):
-    parts = []
-    pos = 0
-    while pos < len(line):
-        earliest = None
-        for pat in _QUOTE_REGEXES:
-            m = pat.search(line, pos)
-            if m and (earliest is None or m.start() < earliest.start()):
-                earliest = m
-        if not earliest:
-            tail = line[pos:].strip()
-            if tail:
-                parts.append(("narration", tail, "", ""))  # (type, text, pre_ctx, post_ctx)
-            break
-
-        # 따옴표 전 나레이션
-        pre_text = line[pos:earliest.start()]
-        if pre_text.strip():
-            parts.append(("narration", pre_text.strip(), "", ""))
-
-        # 따옴표 안 대사
-        quote_text = earliest.group(1).strip()
-        pre_ctx = line[max(0, earliest.start()-40):earliest.start()]
-        post_ctx = line[earliest.end():min(len(line), earliest.end()+40)]
-        parts.append(("quote", quote_text, pre_ctx, post_ctx))
-
-        pos = earliest.end()
-
-    return parts  # [("narration" | "quote", text, pre_ctx, post_ctx), ...]
-
-def parse_utterances_from_text(text: str):
-    """
-    고급 파서:
-      - 장(씬) 헤더 인식(#, ##, '1장.' / 'CHAPTER 1')
-      - 'Sx: ...' 형식은 그대로 화자 지정
-      - 같은 줄에 따옴표 안 대사 + 보고문이 섞여 있으면
-        * 따옴표 안은 화자(보고문 추정)가 말한 것으로,
-        * 따옴표 밖은 Narrator로 분리
-    반환: [{speaker_id, scene, utterance}, ...]
-    """
+def _parse_with_fsm(text: str) -> List[Dict]:
+    """줄바꿈을 포함해 따옴표 내부는 '한 화자 한 덩어리'로 수집하는 FSM 파서."""
     lines = text.splitlines()
-    current_scene = "default"
-    items = []
+    scene = "default"
+    items: List[Dict] = []
 
+    in_quote = False
+    q_close = ""
+    quote_buf: List[str] = []
+    # 나레이션은 라인 단위로 모으되, 연속이면 merge 단계에서 합쳐짐
     for raw in lines:
-        line = raw.strip()
-        if not line:
-            continue
+        line = raw.rstrip("\n")
+        s = line.strip()
 
-        # 씬 헤더
-        if re.match(r'^(#+)\s+(.+)', line):
-            current_scene = re.sub(r'^(#+)\s+', '', line)
-            continue
-        if re.match(r'^(\d+\s*장\.?|CHAPTER\s+\d+)', line, flags=re.I):
-            current_scene = line
-            continue
+        # 따옴표 밖에서만 씬/명시화자 처리
+        if not in_quote:
+            # 씬 헤더
+            m = re.match(r'^(#+)\s+(.+)', s)
+            if m:
+                scene = re.sub(r'^(#+)\s+', '', s)
+                continue
+            if re.match(r'^(\d+\s*장\.?|CHAPTER\s+\d+)', s, flags=re.I):
+                scene = s
+                continue
+            # 명시화자: S1: ...
+            m = re.match(r'^(S[\w\d]+)\s*:\s*(.+)$', s)
+            if m:
+                spk, utt = m.group(1), m.group(2).strip()
+                if utt:
+                    items.append({"speaker_id": spk, "scene": scene, "utterance": utt})
+                continue
 
-        # 명시적 화자: S1: ...
-        m = re.match(r'^(S[\w\d]+)\s*:\s*(.+)$', line)
-        if m:
-            speaker = m.group(1)
-            utt = m.group(2).strip()
-            if utt:
-                items.append({"speaker_id": speaker, "scene": current_scene, "utterance": utt})
-            continue
+        i = 0
+        pre_ctx_tail = ""  # 따옴표 직전 컨텍스트
+        while i < len(line):
+            ch = line[i]
+            # 따옴표 시작
+            if not in_quote and ch in _QUOTE_PAIRS:
+                q_close = _QUOTE_PAIRS[ch]
+                in_quote = True
+                pre_ctx_tail = line[max(0, i-40):i]
+                i += 1
+                quote_buf = []
+                continue
+            # 따옴표 내부
+            if in_quote:
+                if ch == q_close:
+                    # 따옴표 닫힘 → 한 화자 한 덩어리
+                    qtext = "".join(quote_buf).strip()
+                    post_ctx = line[i+1:i+1+40]
+                    spk = _detect_speaker_name(pre_ctx_tail, post_ctx) or "Unknown"
+                    items.append({"speaker_id": spk, "scene": scene, "utterance": qtext})
+                    in_quote = False
+                    q_close = ""
+                    quote_buf = []
+                    i += 1
+                    continue
+                else:
+                    quote_buf.append(ch)
+                    i += 1
+                    continue
+            # 따옴표 밖(나레이션)
+            i += 1
+        # 라인 종료시 처리
+        if not in_quote and s:
+            items.append({"speaker_id": "Narrator", "scene": scene, "utterance": s})
+        if in_quote:
+            quote_buf.append("\n")  # 멀티라인 대사 유지
 
-        # 따옴표 기반 분리
-        parts = _split_line_by_quotes(line)
+    # 파일 끝에 따옴표가 닫히지 않은 경우(예외)도 한 덩어리로 수집
+    if in_quote and quote_buf:
+        items.append({"speaker_id": "Unknown", "scene": scene, "utterance": "".join(quote_buf).strip()})
 
-        # 따옴표가 없으면 그냥 나레이션
-        if not parts or all(t != "quote" for t, *_ in parts):
-            items.append({"speaker_id": "Narrator", "scene": current_scene, "utterance": line})
-            continue
+    return _merge_adjacent(items)
 
-        # 따옴표가 있으면, 각 조각을 역할에 따라 추가
-        for (ptype, text_piece, pre_ctx, post_ctx) in parts:
-            if ptype == "narration":
-                if text_piece:
-                    items.append({"speaker_id": "Narrator", "scene": current_scene, "utterance": text_piece})
-            else:  # quote
-                speaker_name = _detect_speaker_name(pre_ctx, post_ctx) or "Unknown"
-                items.append({"speaker_id": speaker_name, "scene": current_scene, "utterance": text_piece})
-
-    return items
+def parse_utterances_from_text(text: str) -> List[Dict]:
+    """외부에서 호출되는 파서: FSM 기반."""
+    return _parse_with_fsm(text)
 
 # -------------------------------------------------
-# LLM Bootstrap (Option A)
+# LLM Bootstrap (Option A): TXT만으로 카드/가이드/사전 생성
 # -------------------------------------------------
+def _top_speakers(items, top_n=8):
+    cnt = Counter([it["speaker_id"] for it in items])
+    return [spk for spk, _ in cnt.most_common(top_n)]
+
+def _speaker_samples(items, top_n=8, max_lines_per_speaker=40):
+    tops = set(_top_speakers(items, top_n=top_n))
+    by_spk = {}
+    for it in items:
+        spk = it["speaker_id"]
+        if spk not in tops:
+            continue
+        by_spk.setdefault(spk, [])
+        if len(by_spk[spk]) < max_lines_per_speaker:
+            by_spk[spk].append(it["utterance"])
+    return {spk: "\n".join(lines) for spk, lines in by_spk.items()}
+
 CHAR_CARD_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "너는 대사 말투 분석가다. 각 화자의 말투/성격/호칭/금지·권장 표현/감정 경향을 1~2문장으로 요약한다. "
-     "출력은 각 줄에 'Sx: 요약...' 형식만 사용한다. 불명확하면 추정값을 표시하라."),
+     "출력은 각 줄에 '이름: 요약...' 형식만 사용한다. 불명확하면 추정값을 표시하라."),
     ("human",
-     "다음은 화자별 대사 샘플이다(키=화자ID, 값=샘플 대사들).\n"
+     "다음은 화자별 대사 샘플이다(키=화자ID/이름, 값=샘플 대사들).\n"
      "{samples}\n\n"
-     "각 화자에 대해 한 줄씩 'Sx: ...'로 출력해라.")
+     "각 화자에 대해 한 줄씩 '이름: ...'로 출력해라.")
 ])
 
 STYLE_GUIDE_PROMPT = ChatPromptTemplate.from_messages([
@@ -474,22 +556,6 @@ LEXICON_PROMPT = ChatPromptTemplate.from_messages([
      "용어 리스트:\n{terms}\n\nJSON만 출력하라.")
 ])
 
-def _top_speakers(items, top_n=8):
-    cnt = Counter([it["speaker_id"] for it in items])
-    return [spk for spk, _ in cnt.most_common(top_n)]
-
-def _speaker_samples(items, top_n=8, max_lines_per_speaker=40):
-    tops = set(_top_speakers(items, top_n=top_n))
-    by_spk = {}
-    for it in items:
-        spk = it["speaker_id"]
-        if spk not in tops:
-            continue
-        by_spk.setdefault(spk, [])
-        if len(by_spk[spk]) < max_lines_per_speaker:
-            by_spk[spk].append(it["utterance"])
-    return {spk: "\n".join(lines) for spk, lines in by_spk.items()}
-
 def _extract_terms_for_lexicon(text: str, limit=200):
     toks = set(re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]+", text))
     toks = [t for t in toks if len(t) > 1]
@@ -499,12 +565,12 @@ def _extract_terms_for_lexicon(text: str, limit=200):
 @app.post("/bootstrap_from_txt_upload")
 async def bootstrap_from_txt_upload(
     novel: UploadFile = File(...),
-    also_ingest: Optional[bool] = True,
-    top_speakers: Optional[int] = 8,
-    max_lines_per_speaker: Optional[int] = 40,
-    corpus_id: Optional[str] = None,
+    also_ingest: Optional[bool] = Form(True),
+    top_speakers: Optional[int] = Form(8),
+    max_lines_per_speaker: Optional[int] = Form(40),
+    corpus_id: Optional[str] = Form(None),
 ):
-    """TXT만으로 캐릭터 카드/스타일 가이드/발음 사전을 LLM으로 자동 생성(A 방법)."""
+    """TXT만으로 캐릭터 카드/스타일 가이드/발음 사전을 생성(A)하고 (옵션) 즉시 인덱싱."""
     try:
         session_id = f"sess-{uuid.uuid4().hex[:8]}"
         session_dir = UPLOAD_DIR / session_id
@@ -514,18 +580,19 @@ async def bootstrap_from_txt_upload(
             f.write(novel.file.read())
 
         text = load_text_file(novel_path)
-        corpus_id = _resolve_corpus_id(novel_path, corpus_id)
+        corpus_id = _sanitize_corpus_id(corpus_id or novel_path.stem)
 
-        # 1) 파싱 → 샘플
+        # 파싱 → 샘플
         items = parse_utterances_from_text(text)
-        samples = _speaker_samples(items, top_n=int(top_speakers or 8), max_lines_per_speaker=int(max_lines_per_speaker or 40))
+        samples = _speaker_samples(items, top_n=int(top_speakers or 8),
+                                   max_lines_per_speaker=int(max_lines_per_speaker or 40))
 
-        # 2) 캐릭터 카드
+        # 캐릭터 카드
         cc_text = (CHAR_CARD_PROMPT | LLM).invoke({"samples": json.dumps(samples, ensure_ascii=False)}).content
-        # 3) 스타일 가이드
+        # 스타일 가이드
         snippet = "\n".join([it["utterance"] for it in items[:200]])
         sg_md = (STYLE_GUIDE_PROMPT | LLM).invoke({"snippet": snippet}).content
-        # 4) 발음 사전
+        # 발음 사전
         terms = _extract_terms_for_lexicon(text, limit=200)
         lx_json = (LEXICON_PROMPT | LLM).invoke({"terms": "\n".join(terms)}).content
         try:
@@ -535,7 +602,7 @@ async def bootstrap_from_txt_upload(
         except Exception:
             lex_map = {t: t for t in terms}
 
-        # 5) 저장
+        # 저장
         cc_path = session_dir / "character_cards.txt"
         sg_path = session_dir / "style_guide.md"
         lx_path = session_dir / "lexicon.json"
@@ -543,14 +610,14 @@ async def bootstrap_from_txt_upload(
         sg_path.write_text(sg_md, encoding="utf-8")
         lx_path.write_text(json.dumps(lex_map, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # 6) (옵션) 인덱싱
+        # 캐릭터명 수집(업로드 카드와 동일한 파서 재사용)
+        _ = to_docs_character_cards(cc_text, corpus_id=corpus_id)  # CHAR_NAMES에 반영됨(메모리)
+
+        # (옵션) 인덱싱
         added = None
         if also_ingest:
             res = ingest_corpus_from_paths(novel_path, cc_path, sg_path, lx_path, corpus_id=corpus_id)
             added = res.get("added", {})
-        else:
-            # also_ingest가 false여도, 서버 메모리 Lexicon에는 미리 반영(선택 사항)
-            LEXICONS[corpus_id].update(lex_map)
 
         return JSONResponse({
             "downloads": {
@@ -580,7 +647,7 @@ def ingest_json(payload: Dict = Body(...)):
         if not novel_path.exists():
             raise HTTPException(status_code=400, detail="novel_path not found")
 
-        corpus_id = payload.get("corpus_id")
+        corpus_id = _sanitize_corpus_id(payload.get("corpus_id") or novel_path.stem)
         cc = payload.get("character_cards_path")
         sg = payload.get("style_guides_path")
         lx = payload.get("lexicon_path")
@@ -602,8 +669,9 @@ async def ingest_upload(
     character_cards: Optional[UploadFile] = File(None),
     style_guide: Optional[UploadFile] = File(None),
     lexicon: Optional[UploadFile] = File(None),
-    corpus_id: Optional[str] = None,
+    corpus_id: Optional[str] = Form(None),
 ):
+    """브라우저에서 txt/md/json 파일 업로드 → 즉시 인덱싱."""
     session_dir = UPLOAD_DIR / f"sess-{uuid.uuid4().hex[:8]}"
     session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -619,8 +687,10 @@ async def ingest_upload(
         sg_path = _save(style_guide, f"style_{style_guide.filename}") if style_guide else None
         lx_path = _save(lexicon, f"lexicon_{lexicon.filename}") if lexicon else None
 
-        corpus_id = _resolve_corpus_id(novel_path, corpus_id)
-        res = ingest_corpus_from_paths(novel_path, cc_path, sg_path, lx_path, corpus_id=corpus_id)
+        res = ingest_corpus_from_paths(
+            novel_path, cc_path, sg_path, lx_path,
+            corpus_id=_sanitize_corpus_id(corpus_id or novel_path.stem)
+        )
         return JSONResponse(res)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"ingest_upload failed: {e}")
@@ -631,10 +701,12 @@ async def tts(payload: Dict = Body(...)):
         utterance = payload.get("utterance")
         speaker_id = payload.get("speaker_id", "S1")
         scene = payload.get("scene", "default")
-        corpus_id = _sanitize_corpus_id(payload.get("corpus_id", DEFAULT_CORPUS))
+        corpus_id = _sanitize_corpus_id(payload.get("corpus_id") or DEFAULT_CORPUS)
         if not utterance:
             raise HTTPException(status_code=400, detail="utterance is required")
-        return JSONResponse(generate_tts_prompt(utterance, speaker_id, scene, corpus_id))
+        # 화자명도 카드 기준으로 정규화
+        speaker_id = _best_match(speaker_id, corpus_id)
+        return JSONResponse(generate_tts_prompt_sync(utterance, speaker_id, scene, corpus_id))
     except HTTPException:
         raise
     except Exception as e:
@@ -643,11 +715,11 @@ async def tts(payload: Dict = Body(...)):
 @app.post("/tts_from_txt_upload")
 async def tts_from_txt_upload(
     novel: UploadFile = File(...),
-    also_ingest: Optional[bool] = True,
-    max_items: Optional[int] = None,
-    corpus_id: Optional[str] = None,
+    also_ingest: Optional[bool] = Form(True),
+    max_items: Optional[int] = Form(None),
+    corpus_id: Optional[str] = Form(None),
 ):
-    """TXT 전체를 업로드 → (옵션) 인덱싱 → 발화별 TTS JSON → 합치기"""
+    """TXT 전체 업로드 → (옵션) 인덱싱 → 발화별 TTS JSON(동시 처리) → 묶어서 반환"""
     try:
         session_id = f"sess-{uuid.uuid4().hex[:8]}"
         session_dir = UPLOAD_DIR / session_id
@@ -657,7 +729,7 @@ async def tts_from_txt_upload(
             f.write(novel.file.read())
 
         text = load_text_file(novel_path)
-        corpus_id = _resolve_corpus_id(novel_path, corpus_id)
+        corpus_id = _sanitize_corpus_id(corpus_id or novel_path.stem)
 
         if also_ingest:
             ingest_corpus_from_paths(novel_path, corpus_id=corpus_id)
@@ -669,10 +741,17 @@ async def tts_from_txt_upload(
             except Exception:
                 pass
 
-        outputs = []
+        # 🔹 화자명 정규화(캐릭터 카드와 매칭)
         for it in items:
-            out = generate_tts_prompt(it["utterance"], it["speaker_id"], it["scene"], corpus_id)
-            outputs.append(out)
+            it["speaker_id"] = _best_match(it["speaker_id"], corpus_id)
+
+        # 🔹 동시 처리로 LLM 호출 속도↑
+        sem = asyncio.Semaphore(BATCH_CONCURRENCY)
+        async def one(it):
+            async with sem:
+                return await generate_tts_prompt_async(it["utterance"], it["speaker_id"], it["scene"], corpus_id)
+
+        outputs = await asyncio.gather(*[one(it) for it in items])
 
         out_path = session_dir / "tts_prompts.json"
         with open(out_path, "w", encoding="utf-8") as f:
@@ -706,7 +785,7 @@ def ingest_session(payload: Dict = Body(...)):
         if not (novel_path and novel_path.exists()):
             raise HTTPException(status_code=400, detail="novel file not found in session")
 
-        corpus_id = _resolve_corpus_id(novel_path, payload.get("corpus_id"))
+        corpus_id = _sanitize_corpus_id(payload.get("corpus_id") or novel_path.stem)
         cc_path = session_dir / "character_cards.txt"
         sg_path = session_dir / "style_guide.md"
         lx_path = session_dir / "lexicon.json"

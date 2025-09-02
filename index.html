@@ -26,8 +26,8 @@
   <h1>📚 RAG → 🔊 TTS Prompt Demo</h1>
 
   <div class="card">
-    <div class="pill">공통</div> <b>작품 ID 설정</b>
-    <p class="hint">작품별로 ID를 지정하면, 같은 DB에서도 검색이 섞이지 않습니다. 비워두면 파일명 기반으로 자동 지정됩니다.</p>
+    <div class="pill">공통</div> <b>작품 ID 설정(선택)</b>
+    <p class="hint">같은 DB에 여러 작품을 넣어도 <b>corpus_id</b>로 분리 저장/검색됩니다. 비우면 파일명으로 자동 설정.</p>
     <div class="row">
       <div class="col">
         <label>작품 ID (corpus_id)
@@ -136,7 +136,7 @@
 
   <div class="card">
     <div class="pill">Step 3 (배치)</div> <b>원문 TXT 전체 → TTS JSON 묶음</b>
-    <p class="hint">원문 TXT를 그대로 올리면, 자동으로 <b>토큰 제한을 넘지 않도록 분할</b>하여 각 발화별 TTS 프롬프트를 생성하고, 하나의 JSON으로 합쳐서 돌려줍니다.</p>
+    <p class="hint">원문 TXT를 그대로 올리면, 자동으로 <b>토큰 제한을 넘지 않도록 분할</b>하고, 각 발화별 TTS 프롬프트를 생성해 합쳐줍니다.</p>
     <div class="row">
       <div class="col">
         <label>원문 TXT 업로드
@@ -167,7 +167,10 @@
 
   <script>
     const $ = (sel) => document.querySelector(sel);
-    const log = (el, msg, cls="") => { el.textContent = msg; el.className = cls? "log "+cls : "log"; };
+    const log = (el, msg, cls="") => {
+      el.textContent = msg;
+      if (cls) el.className = "log " + cls; else el.className = "log";
+    };
     const getCorpus = () => ($('#corpus-id').value || '').trim();
 
     async function ingest() {
@@ -285,7 +288,8 @@
       log($('#tts-out'), '');
       try {
         const res = await fetch('/tts', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
         const data = await res.json();
@@ -305,8 +309,7 @@
       if (!novel) { alert('원문 TXT를 선택하세요'); return; }
       const fd = new FormData();
       fd.append('novel', novel);
-      const also = $('#also-ingest').value === 'true';
-      fd.append('also_ingest', also ? 'true' : 'false');
+      fd.append('also_ingest', $('#also-ingest').value === 'true' ? 'true' : 'false');
       const maxItemsVal = $('#max-items').value.trim();
       if (maxItemsVal) fd.append('max_items', maxItemsVal);
       const corpus = getCorpus();
